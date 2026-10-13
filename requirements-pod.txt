@@ -13,3 +13,4 @@ numpy
 boto3
 PyYAML
 av
+audioread
