@@ -14,11 +14,11 @@ def sync_prefix(s3_prefix, local_dir, required=()):
     """s3_prefix 아래 전체를 local_dir로 받는다(이미 있는 파일은 크기가 같으면 건너뜀). required 파일이 다 있으면 S3를 보지 않는다."""
     if required and all(os.path.exists(os.path.join(local_dir, r)) for r in required):
         return local_dir
-    import boto3
+    from concurrent.futures import ThreadPoolExecutor
     bucket, prefix = _split(s3_prefix.rstrip("/") + "/")
-    client = boto3.client("s3")
+    client = _client()
     paginator = client.get_paginator("list_objects_v2")
-    n = 0
+    todo = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             rel = obj["Key"][len(prefix):]
@@ -27,11 +27,18 @@ def sync_prefix(s3_prefix, local_dir, required=()):
             dst = os.path.join(local_dir, rel)
             if os.path.exists(dst) and os.path.getsize(dst) == obj["Size"]:
                 continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            tmp = dst + ".part"
-            client.download_file(bucket, obj["Key"], tmp)
-            os.replace(tmp, dst)
-            n += 1
+            todo.append((obj["Key"], dst))
+
+    def fetch(key_dst):
+        key, dst = key_dst
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        client.download_file(bucket, key, tmp, Config=_transfer_config())
+        os.replace(tmp, dst)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(fetch, todo))
+    n = len(todo)
     logger.info(f"synced {n} files from {s3_prefix} -> {local_dir}")
     missing = [r for r in required if not os.path.exists(os.path.join(local_dir, r))]
     if missing:
@@ -39,8 +46,20 @@ def sync_prefix(s3_prefix, local_dir, required=()):
     return local_dir
 
 
-def download_object(uri, dst):
+def _client():
+    """S3_ACCELERATE=1이면 가속 엔드포인트(EU pod ↔ ap-northeast-2 버킷에서 6 MB/s → 200 MB/s 실측, 2026-10-13)."""
     import boto3
+    from botocore.config import Config
+    accel = os.environ.get("S3_ACCELERATE", "0") == "1"
+    return boto3.client("s3", config=Config(s3={"use_accelerate_endpoint": accel}, max_pool_connections=64))
+
+
+def _transfer_config():
+    from boto3.s3.transfer import TransferConfig
+    return TransferConfig(max_concurrency=16, multipart_chunksize=64 * 1024 * 1024)
+
+
+def download_object(uri, dst):
     bucket, key = _split(uri)
-    boto3.client("s3").download_file(bucket, key, dst)
+    _client().download_file(bucket, key, dst, Config=_transfer_config())
     return dst
